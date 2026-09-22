@@ -26,8 +26,6 @@ task per printer.
 1. Fill in one entry per printer under `printers`, each with a unique `device_id`,
      a `name`, and the `moonraker_url` (e.g. `http://<pi-ip>:7125`).
      `api_key` is only needed if you've enabled Moonraker's API key auth.
-2. `pip install -r requirements.txt`
-3. Run: `python3 main.py`
 
 For your Ender 3 V3 SE on the Rpi4, if the bridge runs on the *same* Pi as
 Moonraker, `http://localhost:7125` works. If it runs elsewhere on your
