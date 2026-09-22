@@ -4,7 +4,7 @@ Bridges any Klipper-based 3D printer running [Moonraker](https://moonraker.readt
 to IRIS Home. Supports multiple printers from one bridge process — each gets
 its own entry in `config.json` and its own IRIS device / WebSocket connection.
 
-## How it's structured (same shape as `wiz-lights`)
+## How it's structured:
 
 - `KlipperController` — one instance per printer, wraps that printer's
   Moonraker HTTP API. Every method returns a `Result(success, message, data)`.
