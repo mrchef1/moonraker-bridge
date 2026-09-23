@@ -4,12 +4,19 @@ Bridges any Klipper-based 3D printer running [Moonraker](https://moonraker.readt
 to IRIS Home. Supports multiple printers from one bridge process — each gets
 its own entry in `config.json` and its own IRIS device / WebSocket connection.
 
-## How it's structured:
+## How it's structured
 
-- `KlipperController` — one instance per printer, wraps that printer's
-  Moonraker HTTP API. Every method returns a `Result(success, message, data)`.
-- `functions` dict — maps command names (`get_status`, `home`, `start_print`,
-  etc.) to controller methods, used to dispatch commands coming from the
+What IRIS Home actually requires from a bridge is just the WebSocket part:
+one connection per device, sending device-update structs and reacting to
+commands. There's no need for a Controller/Result-style wrapper class, so
+this version doesn't have one:
+
+- Plain `async def` functions (`get_status`, `home`, `start_print`, etc.) —
+  each talks to Moonraker's HTTP API directly and either returns a plain
+  JSON-able dict or raises.
+- `functions` dict — built fresh inside `ws_loop` for each printer, binding
+  every command function to that printer's `session`/`base_url`/`headers`
+  via `functools.partial`. This is what dispatches commands coming from the
   IRIS backend over the WebSocket.
 - `ws_loop` — one per printer. Connects to
   `wss://backend.irisapis.us/api/devices/ws/{user}/{device_id}`, polls
@@ -23,9 +30,14 @@ task per printer.
 
 ## Setup
 
-1. Fill in one entry per printer under `printers`, each with a unique `device_id`,
+1. Copy `config.example.json` to `/home/iris/hub/config.json` (or wherever
+   your other bridges read config from) and fill in:
+   - `user`: your IRIS username, same as the WiZ bridge uses
+   - one entry per printer under `printers`, each with a unique `device_id`,
      a `name`, and the `moonraker_url` (e.g. `http://<pi-ip>:7125`).
      `api_key` is only needed if you've enabled Moonraker's API key auth.
+2. `pip install -r requirements.txt`
+3. Run: `python3 main.py`
 
 For your Ender 3 V3 SE on the Rpi4, if the bridge runs on the *same* Pi as
 Moonraker, `http://localhost:7125` works. If it runs elsewhere on your
