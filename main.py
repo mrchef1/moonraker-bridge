@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-Klipper / Moonraker Bridge — LLM-ready tool interface via WebSocket
+Klipper / Moonraker Bridge — WebSocket interface for IRIS Home
 
-Bridges one or more Klipper-based 3D printers (each running Moonraker) to
-IRIS Home, following the same shape as the WiZ light bridge:
-    - a Controller class with async methods that all return a Result
-    - a `functions` dict used to dispatch incoming backend commands
-    - a per-device WebSocket loop that polls state, pushes changes, and
-      relays commands back to the printer
+What IRIS Home actually requires from a bridge:
+    1. Open one WebSocket per device to
+       wss://backend.irisapis.us/api/devices/ws/{user}/{device_id}
+    2. Send a device-update struct over that socket whenever the device's
+       state changes (or on a heartbeat), so the backend stays in sync.
+    3. Listen on that same socket for commands and act on them.
 
-Unlike WiZ bulbs, Klipper printers aren't discoverable via broadcast — each
-one is a Moonraker instance at a known host:port. So instead of a discovery
-step, this bridge reads a list of printers from config.json and spins up one
-WebSocket connection (one IRIS device) per printer. Adding another
-Klipper-based printer later (Ender 3, Voron, Prusa w/ Klipper, etc.) is just
-another entry in that list — no code changes needed.
+Everything below is just plain async functions that talk to a printer's
+Moonraker HTTP API — no Controller/Result wrapper, since that's not part of
+what IRIS needs. Each function either returns a plain JSON-able dict or
+raises, and the WS loop's dispatcher turns that into a result/error message
+back over the socket.
+
+Since Klipper printers aren't broadcast-discoverable like WiZ bulbs (each is
+a Moonraker instance at a known host:port), config.json holds a *list* of
+printers, and main() opens one WS connection (one IRIS device) per printer.
 """
 
 import asyncio
@@ -25,6 +28,7 @@ import websockets
 
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -57,22 +61,6 @@ STATUS_OBJECTS = [
 ]
 
 
-# ── Data Models ──────────────────────────────────────────────────────────────
-
-@dataclass
-class Result:
-    success: bool
-    message: str
-    data: Optional[Dict[str, Any]] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "success": self.success,
-            "message": self.message,
-            "data": self.data,
-        }
-
-
 @dataclass
 class PrinterConfig:
     device_id: str          # unique id used as the IRIS device id
@@ -80,234 +68,6 @@ class PrinterConfig:
     moonraker_url: str      # e.g. "http://localhost:7125"
     api_key: Optional[str] = None  # only needed if Moonraker auth is enabled
 
-
-# ── Klipper Controller (one instance per printer, returns Results) ─────────
-
-class KlipperController:
-    """
-    Wraps one Moonraker instance's HTTP API. See:
-    https://moonraker.readthedocs.io/en/latest/external_api/printer/
-    """
-
-    def __init__(self, printer: PrinterConfig, session: aiohttp.ClientSession):
-        self.printer = printer
-        self.session = session
-        self.base_url = printer.moonraker_url.rstrip("/")
-        self.headers = {"X-Api-Key": printer.api_key} if printer.api_key else {}
-        self.timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-
-    # ── Low-level HTTP helpers ────────────────────────────────────────────
-
-    async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        async with self.session.get(
-            f"{self.base_url}{path}", params=params,
-            headers=self.headers, timeout=self.timeout,
-        ) as resp:
-            resp.raise_for_status()
-            body = await resp.json()
-            return body.get("result", body)
-
-    async def _post(self, path: str, json_body: Optional[Dict[str, Any]] = None,
-                     params: Optional[Dict[str, Any]] = None) -> Any:
-        async with self.session.post(
-            f"{self.base_url}{path}", json=json_body, params=params,
-            headers=self.headers, timeout=self.timeout,
-        ) as resp:
-            resp.raise_for_status()
-            body = await resp.json()
-            return body.get("result", body)
-
-    # ── Status ──────────────────────────────────────────────────────────────
-
-    async def get_status(self) -> Result:
-        try:
-            # GET with a bare query string requests all attributes of each
-            # listed object, e.g. ?print_stats&toolhead&extruder
-            query = "&".join(STATUS_OBJECTS)
-            result = await self._get(f"/printer/objects/query?{query}")
-            status = result.get("status", {})
-
-            print_stats = status.get("print_stats", {}) or {}
-            toolhead = status.get("toolhead", {}) or {}
-            extruder = status.get("extruder", {}) or {}
-            heater_bed = status.get("heater_bed", {}) or {}
-            virtual_sdcard = status.get("virtual_sdcard", {}) or {}
-            fan = status.get("fan", {}) or {}
-            display_status = status.get("display_status", {}) or {}
-
-            progress = virtual_sdcard.get("progress")
-            if progress is None:
-                progress = display_status.get("progress")
-
-            return Result(
-                success=True,
-                message="Status retrieved",
-                data={
-                    "state": print_stats.get("state", "unknown"),
-                    "state_message": print_stats.get("message", ""),
-                    "filename": print_stats.get("filename", ""),
-                    "progress_pct": round((progress or 0) * 100, 1),
-                    "print_duration_s": print_stats.get("print_duration"),
-                    "total_duration_s": print_stats.get("total_duration"),
-                    "filament_used_mm": print_stats.get("filament_used"),
-                    "hotend_temp": extruder.get("temperature"),
-                    "hotend_target": extruder.get("target"),
-                    "bed_temp": heater_bed.get("temperature"),
-                    "bed_target": heater_bed.get("target"),
-                    "fan_speed_pct": round((fan.get("speed") or 0) * 100, 1),
-                    "position": toolhead.get("position"),
-                    "homed_axes": toolhead.get("homed_axes"),
-                },
-            )
-        except Exception as e:
-            return Result(success=False, message=f"Error getting status: {e}")
-
-    async def get_info(self) -> Result:
-        """Klippy host info: hostname, software version, ready/error/etc."""
-        try:
-            info = await self._get("/printer/info")
-            return Result(
-                success=True,
-                message="Info retrieved",
-                data={
-                    "state": info.get("state"),
-                    "state_message": info.get("state_message"),
-                    "hostname": info.get("hostname"),
-                    "software_version": info.get("software_version"),
-                },
-            )
-        except Exception as e:
-            return Result(success=False, message=f"Error getting info: {e}")
-
-    # ── GCode / Motion ────────────────────────────────────────────────────
-
-    async def send_gcode(self, script: str) -> Result:
-        if not script or not isinstance(script, str):
-            return Result(success=False, message="script must be a non-empty string")
-        try:
-            await self._post("/printer/gcode/script", json_body={"script": script})
-            return Result(success=True, message=f"Ran: {script}")
-        except Exception as e:
-            return Result(success=False, message=f"GCode error: {e}")
-
-    async def home(self, axes: Optional[str] = None) -> Result:
-        """axes: e.g. 'XYZ', 'XY', 'Z'. Omit/empty to home all axes."""
-        letters = "".join(ch for ch in (axes or "").upper() if ch in "XYZ")
-        script = f"G28 {' '.join(letters)}".strip() if letters else "G28"
-        return await self.send_gcode(script)
-
-    async def move(
-        self,
-        x: Optional[float] = None,
-        y: Optional[float] = None,
-        z: Optional[float] = None,
-        e: Optional[float] = None,
-        feedrate: float = 1500,
-        relative: bool = True,
-    ) -> Result:
-        """Jog the toolhead. Relative moves (the default) are safest for
-        manual jogging since they don't depend on the current position."""
-        parts = []
-        if x is not None:
-            parts.append(f"X{x}")
-        if y is not None:
-            parts.append(f"Y{y}")
-        if z is not None:
-            parts.append(f"Z{z}")
-        if e is not None:
-            parts.append(f"E{e}")
-        if not parts:
-            return Result(success=False, message="Provide at least one of x/y/z/e")
-
-        mode = "G91" if relative else "G90"
-        script = f"{mode}\nG1 {' '.join(parts)} F{feedrate}"
-        if relative:
-            script += "\nG90"  # restore absolute mode afterward
-        return await self.send_gcode(script)
-
-    # ── Temperature / Fan ─────────────────────────────────────────────────
-
-    async def set_extruder_temp(self, temp: float, tool: int = 0) -> Result:
-        return await self.send_gcode(f"M104 T{tool} S{temp}")
-
-    async def set_bed_temp(self, temp: float) -> Result:
-        return await self.send_gcode(f"M140 S{temp}")
-
-    async def set_fan_speed(self, percent: float) -> Result:
-        if not 0 <= percent <= 100:
-            return Result(success=False, message="percent must be 0-100")
-        return await self.send_gcode(f"M106 S{round(percent / 100 * 255)}")
-
-    async def turn_off_heaters(self) -> Result:
-        return await self.send_gcode("TURN_OFF_HEATERS")
-
-    # ── Files ───────────────────────────────────────────────────────────────
-
-    async def list_files(self) -> Result:
-        try:
-            files = await self._get("/server/files/list")
-            return Result(
-                success=True,
-                message=f"Found {len(files)} file(s)",
-                data={"files": [
-                    {"path": f.get("path"), "size": f.get("size"),
-                     "modified": f.get("modified")}
-                    for f in files
-                ]},
-            )
-        except Exception as e:
-            return Result(success=False, message=f"Error listing files: {e}")
-
-    # ── Print Job Management ──────────────────────────────────────────────
-
-    async def start_print(self, filename: str) -> Result:
-        if not filename:
-            return Result(success=False, message="filename is required")
-        try:
-            await self._post("/printer/print/start", params={"filename": filename})
-            return Result(success=True, message=f"Started print: {filename}")
-        except Exception as e:
-            return Result(success=False, message=f"Error starting print: {e}")
-
-    async def pause_print(self) -> Result:
-        try:
-            await self._post("/printer/print/pause")
-            return Result(success=True, message="Print paused")
-        except Exception as e:
-            return Result(success=False, message=f"Error pausing: {e}")
-
-    async def resume_print(self) -> Result:
-        try:
-            await self._post("/printer/print/resume")
-            return Result(success=True, message="Print resumed")
-        except Exception as e:
-            return Result(success=False, message=f"Error resuming: {e}")
-
-    async def cancel_print(self) -> Result:
-        try:
-            await self._post("/printer/print/cancel")
-            return Result(success=True, message="Print cancelled")
-        except Exception as e:
-            return Result(success=False, message=f"Error cancelling: {e}")
-
-    # ── Administration ────────────────────────────────────────────────────
-
-    async def emergency_stop(self) -> Result:
-        try:
-            await self._post("/printer/emergency_stop")
-            return Result(success=True, message="Emergency stop triggered")
-        except Exception as e:
-            return Result(success=False, message=f"Error: {e}")
-
-    async def firmware_restart(self) -> Result:
-        try:
-            await self._post("/printer/firmware_restart")
-            return Result(success=True, message="Firmware restart requested")
-        except Exception as e:
-            return Result(success=False, message=f"Error: {e}")
-
-
-# ── Config Loader ────────────────────────────────────────────────────────────
 
 def load_config():
     data = json.loads(CONFIG_PATH.read_text())
@@ -324,13 +84,201 @@ def load_config():
     return user, printers
 
 
+# ── Moonraker HTTP helpers ───────────────────────────────────────────────────
+# Plain functions, not methods — each takes the session/base_url/headers for
+# whichever printer is calling it. ws_loop binds these per-printer with
+# functools.partial before handing them to the command dispatcher.
+
+async def _get(session: aiohttp.ClientSession, base_url: str, headers: dict,
+                path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with session.get(f"{base_url}{path}", params=params,
+                            headers=headers, timeout=timeout) as resp:
+        resp.raise_for_status()
+        body = await resp.json()
+        return body.get("result", body)
+
+
+async def _post(session: aiohttp.ClientSession, base_url: str, headers: dict,
+                 path: str, json_body: Optional[Dict[str, Any]] = None,
+                 params: Optional[Dict[str, Any]] = None) -> Any:
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with session.post(f"{base_url}{path}", json=json_body, params=params,
+                             headers=headers, timeout=timeout) as resp:
+        resp.raise_for_status()
+        body = await resp.json()
+        return body.get("result", body)
+
+
+# ── Status ───────────────────────────────────────────────────────────────────
+
+async def get_status(session, base_url, headers) -> Dict[str, Any]:
+    query = "&".join(STATUS_OBJECTS)
+    result = await _get(session, base_url, headers, f"/printer/objects/query?{query}")
+    status = result.get("status", {})
+
+    print_stats = status.get("print_stats", {}) or {}
+    toolhead = status.get("toolhead", {}) or {}
+    extruder = status.get("extruder", {}) or {}
+    heater_bed = status.get("heater_bed", {}) or {}
+    virtual_sdcard = status.get("virtual_sdcard", {}) or {}
+    fan = status.get("fan", {}) or {}
+    display_status = status.get("display_status", {}) or {}
+
+    progress = virtual_sdcard.get("progress")
+    if progress is None:
+        progress = display_status.get("progress")
+
+    return {
+        "state": print_stats.get("state", "unknown"),
+        "state_message": print_stats.get("message", ""),
+        "filename": print_stats.get("filename", ""),
+        "progress_pct": round((progress or 0) * 100, 1),
+        "print_duration_s": print_stats.get("print_duration"),
+        "total_duration_s": print_stats.get("total_duration"),
+        "filament_used_mm": print_stats.get("filament_used"),
+        "hotend_temp": extruder.get("temperature"),
+        "hotend_target": extruder.get("target"),
+        "bed_temp": heater_bed.get("temperature"),
+        "bed_target": heater_bed.get("target"),
+        "fan_speed_pct": round((fan.get("speed") or 0) * 100, 1),
+        "position": toolhead.get("position"),
+        "homed_axes": toolhead.get("homed_axes"),
+    }
+
+
+async def get_info(session, base_url, headers) -> Dict[str, Any]:
+    """Klippy host info: hostname, software version, ready/error/etc."""
+    info = await _get(session, base_url, headers, "/printer/info")
+    return {
+        "state": info.get("state"),
+        "state_message": info.get("state_message"),
+        "hostname": info.get("hostname"),
+        "software_version": info.get("software_version"),
+    }
+
+
+# ── GCode / Motion ───────────────────────────────────────────────────────────
+
+async def send_gcode(session, base_url, headers, script: str) -> Dict[str, Any]:
+    if not script or not isinstance(script, str):
+        raise ValueError("script must be a non-empty string")
+    await _post(session, base_url, headers, "/printer/gcode/script",
+                json_body={"script": script})
+    return {"ok": True, "message": f"Ran: {script}"}
+
+
+async def home(session, base_url, headers, axes: Optional[str] = None) -> Dict[str, Any]:
+    """axes: e.g. 'XYZ', 'XY', 'Z'. Omit/empty to home all axes."""
+    letters = "".join(ch for ch in (axes or "").upper() if ch in "XYZ")
+    script = f"G28 {' '.join(letters)}".strip() if letters else "G28"
+    return await send_gcode(session, base_url, headers, script)
+
+
+async def move(
+    session, base_url, headers,
+    x: Optional[float] = None,
+    y: Optional[float] = None,
+    z: Optional[float] = None,
+    e: Optional[float] = None,
+    feedrate: float = 1500,
+    relative: bool = True,
+) -> Dict[str, Any]:
+    """Jog the toolhead. Relative moves (the default) are safest for manual
+    jogging since they don't depend on knowing the current position."""
+    parts = []
+    if x is not None:
+        parts.append(f"X{x}")
+    if y is not None:
+        parts.append(f"Y{y}")
+    if z is not None:
+        parts.append(f"Z{z}")
+    if e is not None:
+        parts.append(f"E{e}")
+    if not parts:
+        raise ValueError("Provide at least one of x/y/z/e")
+
+    mode = "G91" if relative else "G90"
+    script = f"{mode}\nG1 {' '.join(parts)} F{feedrate}"
+    if relative:
+        script += "\nG90"  # restore absolute mode afterward
+    return await send_gcode(session, base_url, headers, script)
+
+
+# ── Temperature / Fan ────────────────────────────────────────────────────────
+
+async def set_extruder_temp(session, base_url, headers, temp: float, tool: int = 0) -> Dict[str, Any]:
+    return await send_gcode(session, base_url, headers, f"M104 T{tool} S{temp}")
+
+
+async def set_bed_temp(session, base_url, headers, temp: float) -> Dict[str, Any]:
+    return await send_gcode(session, base_url, headers, f"M140 S{temp}")
+
+
+async def set_fan_speed(session, base_url, headers, percent: float) -> Dict[str, Any]:
+    if not 0 <= percent <= 100:
+        raise ValueError("percent must be 0-100")
+    return await send_gcode(session, base_url, headers, f"M106 S{round(percent / 100 * 255)}")
+
+
+async def turn_off_heaters(session, base_url, headers) -> Dict[str, Any]:
+    return await send_gcode(session, base_url, headers, "TURN_OFF_HEATERS")
+
+
+# ── Files ────────────────────────────────────────────────────────────────────
+
+async def list_files(session, base_url, headers) -> Dict[str, Any]:
+    files = await _get(session, base_url, headers, "/server/files/list")
+    return {"files": [
+        {"path": f.get("path"), "size": f.get("size"), "modified": f.get("modified")}
+        for f in files
+    ]}
+
+
+# ── Print Job Management ─────────────────────────────────────────────────────
+
+async def start_print(session, base_url, headers, filename: str) -> Dict[str, Any]:
+    if not filename:
+        raise ValueError("filename is required")
+    await _post(session, base_url, headers, "/printer/print/start",
+                params={"filename": filename})
+    return {"ok": True, "message": f"Started print: {filename}"}
+
+
+async def pause_print(session, base_url, headers) -> Dict[str, Any]:
+    await _post(session, base_url, headers, "/printer/print/pause")
+    return {"ok": True, "message": "Print paused"}
+
+
+async def resume_print(session, base_url, headers) -> Dict[str, Any]:
+    await _post(session, base_url, headers, "/printer/print/resume")
+    return {"ok": True, "message": "Print resumed"}
+
+
+async def cancel_print(session, base_url, headers) -> Dict[str, Any]:
+    await _post(session, base_url, headers, "/printer/print/cancel")
+    return {"ok": True, "message": "Print cancelled"}
+
+
+# ── Administration ───────────────────────────────────────────────────────────
+
+async def emergency_stop(session, base_url, headers) -> Dict[str, Any]:
+    await _post(session, base_url, headers, "/printer/emergency_stop")
+    return {"ok": True, "message": "Emergency stop triggered"}
+
+
+async def firmware_restart(session, base_url, headers) -> Dict[str, Any]:
+    await _post(session, base_url, headers, "/printer/firmware_restart")
+    return {"ok": True, "message": "Firmware restart requested"}
+
+
 # ── Device Struct ─────────────────────────────────────────────────────────────
 #
-# NOTE: This mirrors the shape of the WiZ bridge's device struct
-# (id/name/type/status/value/metadata), guessing at reasonable values for a
-# printer. Confirm this against whatever your IRIS backend/frontend actually
-# expects for non-light device types, and adjust the "type"/"status"/"value"
-# mapping below if needed.
+# NOTE: The WiZ bridge's device struct uses "type": "leds" with status
+# "on"/"off" and value = brightness — a schema specific to light devices.
+# There's no printer equivalent to copy, so this guesses at a reasonable
+# shape. Confirm this against whatever your IRIS backend/frontend actually
+# expects for non-light device types, and adjust as needed.
 
 def build_device(printer: PrinterConfig, status: Dict[str, Any]) -> Dict[str, Any]:
     return {
@@ -355,32 +303,39 @@ def build_device(printer: PrinterConfig, status: Dict[str, Any]) -> Dict[str, An
 
 
 # ── WebSocket Loop (one per printer / IRIS device) ──────────────────────────
+# This is the part IRIS Home actually requires: connect, push device-update
+# structs, and act on incoming commands.
 
 async def ws_loop(printer: PrinterConfig, session: aiohttp.ClientSession, user: str):
-    controller = KlipperController(printer, session)
+    base_url = printer.moonraker_url.rstrip("/")
+    headers = {"X-Api-Key": printer.api_key} if printer.api_key else {}
+
+    # Bind each command function to this printer's session/base_url/headers
+    functions = {
+        name: partial(fn, session, base_url, headers)
+        for name, fn in {
+            "get_status": get_status,
+            "get_info": get_info,
+            "send_gcode": send_gcode,
+            "home": home,
+            "move": move,
+            "set_extruder_temp": set_extruder_temp,
+            "set_bed_temp": set_bed_temp,
+            "set_fan_speed": set_fan_speed,
+            "turn_off_heaters": turn_off_heaters,
+            "list_files": list_files,
+            "start_print": start_print,
+            "pause_print": pause_print,
+            "resume_print": resume_print,
+            "cancel_print": cancel_print,
+            "emergency_stop": emergency_stop,
+            "firmware_restart": firmware_restart,
+        }.items()
+    }
 
     # Serialize HTTP calls to Moonraker (commands + polls) and writes to the socket
     printer_lock = asyncio.Lock()
     send_lock = asyncio.Lock()
-
-    functions = {
-        "get_status": controller.get_status,
-        "get_info": controller.get_info,
-        "send_gcode": controller.send_gcode,
-        "home": controller.home,
-        "move": controller.move,
-        "set_extruder_temp": controller.set_extruder_temp,
-        "set_bed_temp": controller.set_bed_temp,
-        "set_fan_speed": controller.set_fan_speed,
-        "turn_off_heaters": controller.turn_off_heaters,
-        "list_files": controller.list_files,
-        "start_print": controller.start_print,
-        "pause_print": controller.pause_print,
-        "resume_print": controller.resume_print,
-        "cancel_print": controller.cancel_print,
-        "emergency_stop": controller.emergency_stop,
-        "firmware_restart": controller.firmware_restart,
-    }
 
     while True:
         try:
@@ -398,15 +353,14 @@ async def ws_loop(printer: PrinterConfig, session: aiohttp.ClientSession, user: 
                     (or if forced / the heartbeat interval has elapsed)."""
                     nonlocal last_sent, last_sent_at
 
-                    async with printer_lock:
-                        status_result = await controller.get_status()
-
-                    if not status_result.success:
-                        print(f"[hub-ws:{printer.device_id}] status poll failed: "
-                              f"{status_result.message}")
+                    try:
+                        async with printer_lock:
+                            status = await functions["get_status"]()
+                    except Exception as e:
+                        print(f"[hub-ws:{printer.device_id}] status poll failed: {e}")
                         return
 
-                    device = build_device(printer, status_result.data or {})
+                    device = build_device(printer, status)
                     heartbeat_due = (time.monotonic() - last_sent_at) >= HEARTBEAT_INTERVAL
                     if not (force or heartbeat_due or device != last_sent):
                         return
@@ -447,16 +401,15 @@ async def ws_loop(printer: PrinterConfig, session: aiohttp.ClientSession, user: 
                             print(f"[hub-ws:{printer.device_id}] unknown function: {name}")
                             continue
 
-                        fn = functions[name]
                         print(f"[hub-ws:{printer.device_id}] calling {name}({args})")
 
                         try:
                             async with printer_lock:
-                                result: Result = await fn(**args)
+                                result = await functions[name](**args)
                             async with send_lock:
                                 await ws.send(json.dumps({
                                     "req": data.get("req"),
-                                    "result": result.to_dict(),
+                                    "result": result,
                                 }))
                         except websockets.ConnectionClosed:
                             raise
